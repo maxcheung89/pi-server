@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+Raspberry Pi SSD1306 OLED Monitor (128x64 / 0.96")
+Shows: IP/hostname | RAM | CPU temp & uptime | Network
+Auto-refreshes every 5 seconds
+"""
+
+import time
+import socket
+import psutil
+from PIL import Image, ImageDraw, ImageFont
+from luma.core.interface.serial import i2c
+from luma.oled.device import ssd1306
+
+# ──────────────────────────────────────────────
+# Display Configuration
+# ──────────────────────────────────────────────
+I2C_ADDRESS = 0x3C   # SSD1306 default; try 0x3D if blank
+I2C_PORT    = 1
+REFRESH_SEC = 5
+
+# ──────────────────────────────────────────────
+# Font — use default bitmap font (always available)
+# For a slightly larger font, install:
+#   sudo apt install fonts-dejavu-core
+#   then set: FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+# ──────────────────────────────────────────────
+try:
+    FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    font = ImageFont.truetype(FONT_PATH, 11)
+    font_small = ImageFont.truetype(FONT_PATH, 10)
+except IOError:
+    font = ImageFont.load_default()
+    font_small = font
+
+LINE_HEIGHT = 15   # pixels between lines (128px tall / 4 lines ≈ 16px)
+
+# ──────────────────────────────────────────────
+# System Info
+# ──────────────────────────────────────────────
+def get_ip_and_hostname():
+    hostname = socket.gethostname()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        try:
+            ip = socket.gethostbyname(hostname)
+        except Exception:
+            ip = "No IP"
+    # Fit both on one line: trim hostname if needed
+    short = hostname if len(hostname) <= 8 else hostname[:8]
+    return f"{ip} {short}"
+
+def get_ram_info():
+    mem = psutil.virtual_memory()
+    total_gb = mem.total / (1024 ** 3)
+    used_mb  = mem.used  / (1024 ** 2)
+    if total_gb < 3:
+        label = "2GB"
+    elif total_gb < 6:
+        label = "4GB"
+    else:
+        label = "8GB"
+    pct = mem.percent
+    return f"RAM:{label} {used_mb:.0f}MB {pct:.0f}%"
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read()) / 1000.0
+    except Exception:
+        temps = psutil.sensors_temperatures()
+        for key in ("cpu_thermal", "cpu-thermal", "coretemp"):
+            if key in temps and temps[key]:
+                return temps[key][0].current
+    return 0.0
+
+def get_uptime_str():
+    seconds = int(time.time() - psutil.boot_time())
+    days    = seconds // 86400
+    hours   = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    if days > 0:
+        return f"{days}d{hours}h"
+    elif hours > 0:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m"
+
+def get_cpu_temp_uptime():
+    temp   = get_cpu_temp()
+    uptime = get_uptime_str()
+    cpu_pct = psutil.cpu_percent(interval=None)
+    return f"T:{temp:.1f}C CPU:{cpu_pct:.0f}% Up:{uptime}"
+
+def get_network_status():
+    # Internet check
+    internet = False
+    try:
+        socket.setdefaulttimeout(2)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+        internet = True
+    except Exception:
+        pass
+
+    # Active interfaces
+    ifaces = []
+    for iface, stat in psutil.net_if_stats().items():
+        if stat.isup and iface != "lo":
+            for addr in psutil.net_if_addrs().get(iface, []):
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    short = iface.replace("eth", "E").replace("wlan", "W")
+                    ifaces.append(short[:4])
+                    break
+
+    iface_str = "+".join(ifaces) if ifaces else "None"
+    web_str   = "OK" if internet else "DOWN"
+    return f"Net:{iface_str} Web:{web_str}"
+
+# ──────────────────────────────────────────────
+# Draw to OLED
+# ──────────────────────────────────────────────
+def draw_screen(device):
+    lines = [
+        get_ip_and_hostname(),
+        get_ram_info(),
+        get_cpu_temp_uptime(),
+        get_network_status(),
+    ]
+
+    image = Image.new("1", (device.width, device.height), 0)
+    draw  = ImageDraw.Draw(image)
+
+    for i, text in enumerate(lines):
+        y = i * LINE_HEIGHT + 1
+        draw.text((0, y), text, font=font, fill=255)
+
+    device.display(image)
+
+    # Debug output
+    print("\n".join(f"[{i+1}] {l}" for i, l in enumerate(lines)))
+    print("-" * 24)
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+def main():
+    print(f"Starting OLED monitor on I2C address {hex(I2C_ADDRESS)}")
+    serial = i2c(port=I2C_PORT, address=I2C_ADDRESS)
+    device = ssd1306(serial)
+    device.contrast(200)
+
+    try:
+        while True:
+            draw_screen(device)
+            time.sleep(REFRESH_SEC)
+    except KeyboardInterrupt:
+        device.clear()
+        print("Display cleared. Goodbye!")
+
+if __name__ == "__main__":
+    main()

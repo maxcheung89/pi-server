@@ -1,0 +1,23 @@
+- name: Baseline config for Raspberry Pis
+  hosts: pis
+  become: true
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade packages
+      apt:
+        upgrade: dist
+
+    - name: Install common tools
+      apt:
+        name:
+          - vim
+          - curl
+          - git
+          - htop
+          - tmux
+          - ufw
+        state: present

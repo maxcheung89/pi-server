@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+Raspberry Pi SSD1306 OLED Monitor (128x64 / 0.96")
+Shows: IP/hostname | RAM | CPU temp & uptime | Network
+Lines that are too wide automatically scroll (marquee effect)
+"""
+
+import time
+import socket
+import psutil
+import threading
+from PIL import Image, ImageDraw, ImageFont
+from luma.core.interface.serial import i2c
+from luma.oled.device import ssd1306
+
+# ──────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────
+I2C_ADDRESS  = 0x3C   # Try 0x3D if blank
+I2C_PORT     = 1
+DATA_REFRESH = 5      # seconds between fetching new system data
+SCROLL_SPEED = 0.04   # seconds per pixel shift (lower = faster scroll)
+SCROLL_GAP   = 30     # pixel gap between end and restart of scroll text
+DISPLAY_W    = 128
+DISPLAY_H    = 64
+LINE_HEIGHT  = 15
+
+try:
+    FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    font = ImageFont.truetype(FONT_PATH, 11)
+except IOError:
+    font = ImageFont.load_default()
+
+# ──────────────────────────────────────────────
+# System Info
+# ──────────────────────────────────────────────
+def get_ip_and_hostname():
+    hostname = socket.gethostname()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        try:
+            ip = socket.gethostbyname(hostname)
+        except Exception:
+            ip = "No IP"
+    return f"{ip} [{hostname}]"
+
+def get_ram_info():
+    mem = psutil.virtual_memory()
+    total_gb = mem.total / (1024 ** 3)
+    used_mb  = mem.used  / (1024 ** 2)
+    label = "2GB" if total_gb < 3 else ("4GB" if total_gb < 6 else "8GB")
+    return f"RAM:{label} {used_mb:.0f}MB {mem.percent:.0f}%"
+
+def get_cpu_temp():
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read()) / 1000.0
+    except Exception:
+        for key in ("cpu_thermal", "cpu-thermal", "coretemp"):
+            temps = psutil.sensors_temperatures()
+            if key in temps and temps[key]:
+                return temps[key][0].current
+    return 0.0
+
+def get_uptime_str():
+    secs  = int(time.time() - psutil.boot_time())
+    days  = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins  = (secs % 3600) // 60
+    if days > 0:   return f"{days}d{hours}h"
+    if hours > 0:  return f"{hours}h{mins}m"
+    return f"{mins}m"
+
+def get_cpu_temp_uptime():
+    cpu = psutil.cpu_percent(interval=None)
+    return f"T:{get_cpu_temp():.1f}C CPU:{cpu:.0f}% Up:{get_uptime_str()}"
+
+def get_network_status():
+    internet = False
+    try:
+        socket.setdefaulttimeout(2)
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+        internet = True
+    except Exception:
+        pass
+    ifaces = []
+    for iface, stat in psutil.net_if_stats().items():
+        if stat.isup and iface != "lo":
+            for addr in psutil.net_if_addrs().get(iface, []):
+                if addr.family == socket.AF_INET and not addr.address.startswith("127."):
+                    ifaces.append(iface.replace("eth", "E").replace("wlan", "W")[:4])
+                    break
+    return f"Net:{'&'.join(ifaces) or 'None'} Web:{'OK' if internet else 'DOWN'}"
+
+def fetch_lines():
+    return [
+        get_ip_and_hostname(),
+        get_ram_info(),
+        get_cpu_temp_uptime(),
+        get_network_status(),
+    ]
+
+# ──────────────────────────────────────────────
+# Text width helper
+# ──────────────────────────────────────────────
+def text_width(text):
+    bbox = font.getbbox(text)
+    return bbox[2] - bbox[0]
+
+# ──────────────────────────────────────────────
+# Scroller — one per line, runs in its own thread
+# ──────────────────────────────────────────────
+class LineScroller:
+    def __init__(self, text=""):
+        self.offset   = 0
+        self.text     = text
+        self.width    = text_width(text)
+        self.scrolling = self.width > DISPLAY_W
+        self._lock    = threading.Lock()
+
+    def update_text(self, text):
+        with self._lock:
+            if text != self.text:
+                self.text      = text
+                self.width     = text_width(text)
+                self.scrolling = self.width > DISPLAY_W
+                self.offset    = 0   # reset scroll on data change
+
+    def tick(self):
+        """Advance scroll offset by 1 pixel."""
+        with self._lock:
+            if self.scrolling:
+                self.offset += 1
+                loop_at = self.width + SCROLL_GAP
+                if self.offset >= loop_at:
+                    self.offset = 0
+
+    def get_render_info(self):
+        with self._lock:
+            return self.text, self.offset, self.scrolling
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
+def main():
+    print(f"Starting OLED monitor — I2C {hex(I2C_ADDRESS)}")
+    serial = i2c(port=I2C_PORT, address=I2C_ADDRESS)
+    device = ssd1306(serial)
+    device.contrast(200)
+
+    # Initialise scrollers
+    initial_lines = fetch_lines()
+    scrollers = [LineScroller(t) for t in initial_lines]
+
+    # Background thread: refresh system data every DATA_REFRESH seconds
+    def data_updater():
+        while True:
+            time.sleep(DATA_REFRESH)
+            try:
+                lines = fetch_lines()
+                for scroller, text in zip(scrollers, lines):
+                    scroller.update_text(text)
+            except Exception as e:
+                print(f"Data refresh error: {e}")
+
+    t = threading.Thread(target=data_updater, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            # Build frame
+            image = Image.new("1", (DISPLAY_W, DISPLAY_H), 0)
+            draw  = ImageDraw.Draw(image)
+
+            for i, scroller in enumerate(scrollers):
+                text, offset, scrolling = scroller.get_render_info()
+                y = i * LINE_HEIGHT + 1
+
+                if not scrolling:
+                    # Fits on screen — draw normally
+                    draw.text((0, y), text, font=font, fill=255)
+                else:
+                    # Draw scrolling text using a wide temp image then crop
+                    loop_w   = scroller.width + SCROLL_GAP
+                    tmp      = Image.new("1", (loop_w * 2, LINE_HEIGHT), 0)
+                    tmp_draw = ImageDraw.Draw(tmp)
+                    # Draw text twice so the loop is seamless
+                    tmp_draw.text((0, 0),      text, font=font, fill=255)
+                    tmp_draw.text((loop_w, 0), text, font=font, fill=255)
+                    # Crop the visible window
+                    crop = tmp.crop((offset, 0, offset + DISPLAY_W, LINE_HEIGHT))
+                    image.paste(crop, (0, y))
+
+                # Advance scroll position for next frame
+                scroller.tick()
+
+            device.display(image)
+            time.sleep(SCROLL_SPEED)
+
+    except KeyboardInterrupt:
+        device.clear()
+        print("Display cleared. Goodbye!")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,165 @@
+---
+# deploy_oled.yml
+# Deploys the SSD1306 OLED system monitor to all Raspberry Pis
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags install
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags deploy
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --limit mavx_server
+
+- name: Deploy OLED System Monitor
+  hosts: pis
+  become: true
+
+  vars:
+    deploy_dir: /opt/oled_monitor
+    script_name: oled_monitor.py
+    service_name: oled-monitor
+    python_bin: /usr/bin/python3
+
+  tasks:
+
+    # ── 1. System packages ───────────────────────────────────────────
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      tags: [install]
+
+    - name: Install required system packages
+      apt:
+        name:
+          - python3-pip
+          - python3-pil
+          - python3-smbus
+          - i2c-tools
+          - libjpeg-dev
+          - fonts-dejavu-core
+        state: present
+      tags: [install]
+
+    # ── 2. Enable I2C ────────────────────────────────────────────────
+    - name: Enable I2C in /boot/config.txt (Pi OS Bullseye and older)
+      lineinfile:
+        path: /boot/config.txt
+        regexp: '^#?dtparam=i2c_arm='
+        line: 'dtparam=i2c_arm=on'
+        backup: yes
+      ignore_errors: yes
+      tags: [install]
+
+    - name: Enable I2C in /boot/firmware/config.txt (Pi OS Bookworm+)
+      lineinfile:
+        path: /boot/firmware/config.txt
+        regexp: '^#?dtparam=i2c_arm='
+        line: 'dtparam=i2c_arm=on'
+        backup: yes
+      ignore_errors: yes
+      tags: [install]
+
+    - name: Load i2c-dev kernel module now
+      modprobe:
+        name: i2c-dev
+        state: present
+      tags: [install]
+
+    - name: Ensure i2c-dev loads on boot
+      lineinfile:
+        path: /etc/modules
+        line: i2c-dev
+        create: yes
+      tags: [install]
+
+    - name: Add super90 to i2c group
+      user:
+        name: super90
+        groups: i2c
+        append: yes
+      ignore_errors: yes
+      tags: [install]
+
+    # ── 3. Python libraries ──────────────────────────────────────────
+    - name: Install Python libraries via pip
+      pip:
+        name:
+          - luma.oled
+          - psutil
+          - Pillow
+        executable: pip3
+        extra_args: --break-system-packages
+      tags: [install]
+
+    # ── 4. Deploy script ─────────────────────────────────────────────
+    - name: Create deployment directory
+      file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      tags: [deploy]
+
+    - name: Copy OLED monitor script
+      copy:
+        src: oled_monitor.py
+        dest: "{{ deploy_dir }}/{{ script_name }}"
+        owner: root
+        group: root
+        mode: '0755'
+      notify: restart oled service
+      tags: [deploy]
+
+    # ── 5. Systemd service ───────────────────────────────────────────
+    - name: Create systemd service unit
+      copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        content: |
+          [Unit]
+          Description=OLED System Monitor (SSD1306 128x64)
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          ExecStart={{ python_bin }} {{ deploy_dir }}/{{ script_name }}
+          WorkingDirectory={{ deploy_dir }}
+          StandardOutput=journal
+          StandardError=journal
+          Restart=always
+          RestartSec=10
+          User=root
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+      notify: restart oled service
+      tags: [deploy]
+
+    - name: Enable and start OLED service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      tags: [deploy]
+
+    # ── 6. Verify ────────────────────────────────────────────────────
+    - name: Check service is running
+      shell: systemctl is-active {{ service_name }}
+      register: service_status
+      changed_when: false
+      failed_when: false
+      tags: [deploy]
+
+    - name: Show service status per host
+      debug:
+        msg: "{{ inventory_hostname }} ({{ ansible_host }}) → oled-monitor: {{ service_status.stdout }}"
+      tags: [deploy]
+
+  # ── Handlers ──────────────────────────────────────────────────────
+  handlers:
+    - name: restart oled service
+      systemd:
+        name: "{{ service_name }}"
+        state: restarted
+        daemon_reload: yes
