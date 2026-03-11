@@ -3,10 +3,12 @@
 # Deploys the SSD1306 OLED system monitor to all Raspberry Pis
 #
 # Usage:
-#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml
-#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags install
-#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags deploy
-#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --limit mavx_server
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml            # full install
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags install  # packages + I2C + NTP
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags deploy   # update script + restart
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags off      # blank screen / stop service
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --tags on       # restore screen / start service
+#   ansible-playbook -i inventory/hosts.ini deploy_oled.yml --limit slot1_ubuntu_desktop_8gb  # single Pi only
 
 - name: Deploy OLED System Monitor
   hosts: pis
@@ -40,22 +42,12 @@
       tags: [install]
 
     # ── 2. Enable I2C ────────────────────────────────────────────────
-    - name: Enable I2C in /boot/config.txt (Pi OS Bullseye and older)
-      lineinfile:
-        path: /boot/config.txt
-        regexp: '^#?dtparam=i2c_arm='
-        line: 'dtparam=i2c_arm=on'
-        backup: yes
-      ignore_errors: yes
-      tags: [install]
-
-    - name: Enable I2C in /boot/firmware/config.txt (Pi OS Bookworm+)
+    - name: Enable I2C in /boot/firmware/config.txt
       lineinfile:
         path: /boot/firmware/config.txt
         regexp: '^#?dtparam=i2c_arm='
         line: 'dtparam=i2c_arm=on'
         backup: yes
-      ignore_errors: yes
       tags: [install]
 
     - name: Load i2c-dev kernel module now
@@ -79,7 +71,31 @@
       ignore_errors: yes
       tags: [install]
 
-    # ── 3. Python libraries ──────────────────────────────────────────
+    # ── 3. NTP time sync — all Pis to Dallas (America/Chicago) ────────
+    - name: Install systemd-timesyncd
+      apt:
+        name: systemd-timesyncd
+        state: present
+      tags: [install]
+
+    - name: Set timezone to America/Chicago (Dallas/Central)
+      community.general.timezone:
+        name: America/Chicago
+      tags: [install]
+
+    - name: Enable and start NTP sync
+      systemd:
+        name: systemd-timesyncd
+        enabled: yes
+        state: started
+      tags: [install]
+
+    - name: Force immediate NTP sync
+      shell: timedatectl set-ntp true && timedatectl
+      changed_when: false
+      tags: [install]
+
+    # ── 4. Python libraries ──────────────────────────────────────────
     - name: Install Python libraries via pip
       pip:
         name:
@@ -90,7 +106,7 @@
         extra_args: --break-system-packages
       tags: [install]
 
-    # ── 4. Deploy script ─────────────────────────────────────────────
+    # ── 5. Deploy script ─────────────────────────────────────────────
     - name: Create deployment directory
       file:
         path: "{{ deploy_dir }}"
@@ -102,7 +118,7 @@
 
     - name: Copy OLED monitor script
       copy:
-        src: oled_monitor.py
+        src: playbooks/oled_monitor.py
         dest: "{{ deploy_dir }}/{{ script_name }}"
         owner: root
         group: root
@@ -110,7 +126,7 @@
       notify: restart oled service
       tags: [deploy]
 
-    # ── 5. Systemd service ───────────────────────────────────────────
+    # ── 6. Systemd service ───────────────────────────────────────────
     - name: Create systemd service unit
       copy:
         dest: /etc/systemd/system/{{ service_name }}.service
@@ -143,7 +159,7 @@
         daemon_reload: yes
       tags: [deploy]
 
-    # ── 6. Verify ────────────────────────────────────────────────────
+    # ── 7. Verify ────────────────────────────────────────────────────
     - name: Check service is running
       shell: systemctl is-active {{ service_name }}
       register: service_status
@@ -155,6 +171,60 @@
       debug:
         msg: "{{ inventory_hostname }} ({{ ansible_host }}) → oled-monitor: {{ service_status.stdout }}"
       tags: [deploy]
+
+    # ── 8. Screen OFF — blank display and stop service ─────────────
+    - name: Stop OLED service
+      systemd:
+        name: "{{ service_name }}"
+        state: stopped
+      ignore_errors: yes
+      tags: [off]
+
+    - name: Blank the OLED screen (send display-off command directly over I2C)
+      shell: |
+        {{ python_bin }} - << 'PYEOF'
+        import smbus2, time
+
+        # SSD1306 command bytes
+        SSD1306_DISPLAYOFF       = 0xAE  # powers off all pixels
+        SSD1306_CHARGEPUMP       = 0x8D
+        SSD1306_CHARGEPUMP_OFF   = 0x10  # disable charge pump (cuts power to panel)
+
+        for addr in [0x3C, 0x3D]:        # try both common addresses
+            try:
+                bus = smbus2.SMBus(1)
+                # 0x00 = command mode for SSD1306
+                bus.write_byte_data(addr, 0x00, SSD1306_CHARGEPUMP)
+                time.sleep(0.01)
+                bus.write_byte_data(addr, 0x00, SSD1306_CHARGEPUMP_OFF)
+                time.sleep(0.01)
+                bus.write_byte_data(addr, 0x00, SSD1306_DISPLAYOFF)
+                bus.close()
+                print(f"Display off sent to {hex(addr)}")
+                break
+            except Exception as e:
+                pass
+        PYEOF
+      ignore_errors: yes
+      tags: [off]
+
+    - name: Confirm screen is off
+      debug:
+        msg: "{{ inventory_hostname }} — OLED screen blanked and service stopped"
+      tags: [off]
+
+    # ── 9. Screen ON — restart service, display resumes ──────────────
+    - name: Start OLED service
+      systemd:
+        name: "{{ service_name }}"
+        state: started
+        daemon_reload: yes
+      tags: [on]
+
+    - name: Confirm screen is on
+      debug:
+        msg: "{{ inventory_hostname }} — OLED service started, display resuming"
+      tags: [on]
 
   # ── Handlers ──────────────────────────────────────────────────────
   handlers:
