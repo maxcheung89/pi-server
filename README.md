@@ -4,7 +4,16 @@ A system monitor for 0.96" SSD1306 OLED displays (128×64px) deployed across
 5 Raspberry Pi 4B units via Ansible. All Pis show the same layout and flip
 pages in sync using wall-clock time — no coordination needed.
 
+---
+This rackmount front panel was designed to efficiently organize multiple Raspberry Pi nodes within a standard 19-inch server rack format.
+
 ![Untitledv1-ezgif com-video-to-gif-converter (1)](https://github.com/user-attachments/assets/b8781872-0bd2-467f-a7f2-d96a8b98dbe8)
+Efficient space utilization, and ease of assembly, allowing each node in the cluster to be installed or replaced independently.
+
+This Pi cluster server rack will be able to download soon from my MakerWord https://makerworld.com/en/@super90
+
+Print it out with your 3D printer! PETG recommended!! 
+
 ---
 
 ## Display Layout
